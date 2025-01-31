@@ -1,0 +1,241 @@
+from flask import Flask, request, jsonify, render_template
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
+import openai
+from dotenv import load_dotenv
+import os
+from flask_cors import CORS
+import logging
+from pyngrok import ngrok
+import threading
+import time
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# Set up ngrok
+ngrok.set_auth_token(os.getenv('NGROK_AUTH_TOKEN'))
+
+# Initialize Twilio client
+twilio_client = Client(
+    os.getenv('TWILIO_ACCOUNT_SID'),
+    os.getenv('TWILIO_AUTH_TOKEN')
+)
+
+# Initialize OpenAI client
+openai.api_key = os.getenv('OPENAI_API_KEY')
+
+# Pre-warm OpenAI connection
+def prewarm_openai():
+    try:
+        logger.info("Pre-warming OpenAI connection...")
+        completion = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Pre-warming connection."},
+                {"role": "user", "content": "Hello"}
+            ],
+            max_tokens=5
+        )
+        logger.info("OpenAI connection pre-warmed successfully")
+    except Exception as e:
+        logger.error(f"Error pre-warming OpenAI connection: {str(e)}")
+
+# Function to periodically re-warm the connection
+def periodic_rewarm():
+    while True:
+        time.sleep(300)  # Re-warm every 5 minutes
+        prewarm_openai()
+
+# Pre-warm when server starts and start periodic re-warming
+prewarm_openai()
+threading.Thread(target=periodic_rewarm, daemon=True).start()
+
+app = Flask(__name__)
+CORS(app)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/initiate-call', methods=['POST'])
+def initiate_call():
+    data = request.json
+    phone_number = data.get('phone_number')
+    conversation_theme = data.get('theme')
+    
+    logger.info(f"Initiating call to {phone_number} with theme: {conversation_theme}")
+    
+    # Store conversation theme in session or database
+    app.conversation_context = {
+        'theme': conversation_theme,
+        'history': []
+    }
+    
+    try:
+        # Create a public URL using ngrok
+        ngrok_url = None
+        tunnels = ngrok.get_tunnels()
+        if tunnels:
+            ngrok_url = tunnels[0].public_url
+        else:
+            ngrok_url = ngrok.connect(5000).public_url
+        
+        if ngrok_url.startswith('http://'):
+            ngrok_url = 'https://' + ngrok_url[7:]
+            
+        webhook_url = f"{ngrok_url}/handle-call"
+        logger.info(f"Using webhook URL: {webhook_url}")
+        
+        # Initiate the call
+        call = twilio_client.calls.create(
+            to=phone_number,
+            from_=os.getenv('TWILIO_PHONE_NUMBER'),
+            url=webhook_url
+        )
+        
+        logger.info(f"Call initiated with SID: {call.sid}")
+        return jsonify({
+            'status': 'success',
+            'message': 'Call initiated',
+            'call_sid': call.sid
+        })
+    except Exception as e:
+        logger.error(f"Error initiating call: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/handle-call', methods=['POST'])
+def handle_call():
+    logger.info("Handling incoming call webhook")
+    logger.debug(f"Request data: {request.form}")
+    
+    try:
+        response = VoiceResponse()
+        
+        # Get the conversation theme
+        theme = getattr(app, 'conversation_context', {}).get('theme', 'Have a friendly conversation')
+        logger.info(f"Using conversation theme: {theme}")
+        
+        # Generate initial AI response based on theme
+        initial_message = generate_ai_response(theme)
+        logger.info(f"Generated initial message: {initial_message}")
+        
+        # Speak the initial message and gather user's response
+        gather = Gather(
+            input='speech', 
+            action='/handle-user-input', 
+            timeout=5,  # Time to wait for user to start speaking
+            speechTimeout=5,  # Time to wait between speech
+            hints=["hello", "hi", "yes", "no"]  # Common words to help with recognition
+        )
+        gather.say(initial_message, voice='Polly.Amy')
+        response.append(gather)
+        
+        # Add a fallback in case the Gather times out
+        response.redirect('/handle-timeout', method='POST')
+        
+        logger.info("Successfully generated TwiML response")
+        return str(response)
+    except Exception as e:
+        logger.error(f"Error handling call: {str(e)}")
+        response = VoiceResponse()
+        response.say("I apologize, but I encountered an error. Please try again later.", voice='Polly.Amy')
+        return str(response)
+
+@app.route('/handle-user-input', methods=['POST'])
+def handle_user_input():
+    logger.info("Handling user input webhook")
+    logger.debug(f"Request data: {request.form}")
+    
+    try:
+        response = VoiceResponse()
+        
+        # Get user's speech input
+        user_speech = request.values.get('SpeechResult', '')
+        logger.info(f"Received user speech: {user_speech}")
+        
+        if user_speech:
+            # Generate AI response based on user's input
+            ai_response = generate_ai_response(user_speech)
+            logger.info(f"Generated AI response: {ai_response}")
+            
+            # Speak AI response and gather next user input
+            gather = Gather(
+                input='speech', 
+                action='/handle-user-input', 
+                timeout=5,  # Time to wait for user to start speaking
+                speechTimeout=5,  # Time to wait between speech
+                hints=["hello", "hi", "yes", "no"]  # Common words to help with recognition
+            )
+            gather.say(ai_response, voice='Polly.Amy')
+            response.append(gather)
+            
+            # Add a fallback in case the Gather times out
+            response.redirect('/handle-timeout', method='POST')
+        else:
+            logger.warning("No speech input received")
+            response.say("I didn't catch that. Could you please repeat?", voice='Polly.Amy')
+            gather = Gather(
+                input='speech', 
+                action='/handle-user-input', 
+                timeout=5,  # Time to wait for user to start speaking
+                speechTimeout=5,  # Time to wait between speech
+                hints=["hello", "hi", "yes", "no"]  # Common words to help with recognition
+            )
+            response.append(gather)
+            
+            # Add a fallback in case the Gather times out
+            response.redirect('/handle-timeout', method='POST')
+        
+        return str(response)
+    except Exception as e:
+        logger.error(f"Error handling user input: {str(e)}")
+        response = VoiceResponse()
+        response.say("I apologize, but I encountered an error. Please try again later.", voice='Polly.Amy')
+        return str(response)
+
+@app.route('/handle-timeout', methods=['POST'])
+def handle_timeout():
+    logger.info("Handling timeout")
+    response = VoiceResponse()
+    response.say("I'm still here with you. Please feel free to continue speaking.", voice='Polly.Amy')
+    gather = Gather(
+        input='speech', 
+        action='/handle-user-input', 
+        timeout=5,
+        speechTimeout=5,
+        hints=["hello", "hi", "yes", "no"]
+    )
+    response.append(gather)
+    response.redirect('/handle-timeout', method='POST')
+    return str(response)
+
+def generate_ai_response(input_text):
+    try:
+        logger.info(f"Generating AI response for input: {input_text}")
+        # Generate response using OpenAI
+        completion = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are having a natural phone conversation. Keep responses very brief (1-2 sentences max) and conversational. Respond quickly as if in real-time chat."},
+                {"role": "user", "content": input_text}
+            ],
+            max_tokens=60,  # Limit response length
+            temperature=0.7  # Slightly lower temperature for more focused responses
+        )
+        response = completion.choices[0].message.content
+        logger.info(f"Generated response: {response}")
+        return response
+    except Exception as e:
+        logger.error(f"Error generating AI response: {str(e)}")
+        return "I'm here with you. Please continue."
+
+if __name__ == '__main__':
+    print("Server starting at http://127.0.0.1:5000")
+    app.run(debug=True, port=5000)
